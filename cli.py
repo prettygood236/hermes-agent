@@ -11514,7 +11514,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.undo_last(_undo_n)
-        elif canonical == "branch":
+        elif canonical in {"branch", "fork"}:
             self._handle_branch_command(cmd_original)
         elif canonical == "worktree":
             self._handle_worktree_command(cmd_original)

@@ -6411,6 +6411,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            parent_chat_id=str(getattr(interaction.channel, "parent_id", "") or "") or None,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -6497,6 +6498,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
 
+        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
+        _parent_id = str(getattr(_parent_channel, "id", "") or "")
+
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
@@ -6505,10 +6509,9 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            parent_chat_id=_parent_id or None,
         )
 
-        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-        _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(
@@ -6871,6 +6874,90 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    async def export_visible_fork_context(
+        self,
+        *,
+        source: Any,
+        event: MessageEvent,
+        limit: int = 50,
+    ) -> list[dict[str, str]]:
+        """Return visible Discord thread history for a gateway visible fork.
+
+        SessionDB is normally enough, but durable Discord lanes can be rebound
+        to a stale/fresh session while the human-visible thread still has the
+        latest conversation. Export a chronological tail from the actual Discord
+        thread/channel so /fork can append it to the copied child session before
+        the new thread starts.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return []
+        thread_id = str(getattr(source, "thread_id", "") or getattr(source, "chat_id", "") or "")
+        if not thread_id:
+            return []
+        try:
+            channel = self._client.get_channel(int(thread_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(thread_id))
+        except Exception as exc:
+            logger.debug("[%s] Visible fork context: cannot resolve %s: %s", self.name, thread_id, exc)
+            return []
+
+        before_obj = None
+        message_id = getattr(event, "message_id", None)
+        discord_object = getattr(discord, "Object", None)
+        if message_id and discord_object is not None:
+            try:
+                before_obj = discord_object(id=int(message_id))
+            except (TypeError, ValueError):
+                before_obj = None
+
+        message_type = getattr(discord, "MessageType", None)
+        default_message = getattr(message_type, "default", None)
+        reply_message = getattr(message_type, "reply", None)
+        allowed_types = {default_message, reply_message}
+
+        rows: list[dict[str, str]] = []
+        try:
+            kwargs: dict[str, Any] = {"limit": max(1, int(limit)), "oldest_first": False}
+            if before_obj is not None:
+                kwargs["before"] = before_obj
+            async for msg in channel.history(**kwargs):
+                if getattr(msg, "type", None) not in allowed_types:
+                    continue
+                content = getattr(msg, "clean_content", None) or getattr(msg, "content", "") or ""
+                content = str(content).strip()
+                if not content and getattr(msg, "attachments", None):
+                    content = "(attachment)"
+                if not content:
+                    continue
+                author = getattr(msg, "author", None)
+                is_self = bool(self._client.user is not None and author == self._client.user)
+                is_bot = bool(getattr(author, "bot", False))
+                if is_self:
+                    rows.append({
+                        "role": "assistant",
+                        "content": content,
+                        "message_id": str(getattr(msg, "id", "")),
+                        "timestamp": getattr(getattr(msg, "created_at", None), "isoformat", lambda: None)(),
+                    })
+                else:
+                    name = getattr(author, "display_name", None) or getattr(author, "name", None) or "Discord user"
+                    if is_bot:
+                        name = f"{name} [bot]"
+                    rows.append({
+                        "role": "user",
+                        "content": f"[{name}] {content}",
+                        "message_id": str(getattr(msg, "id", "")),
+                        "timestamp": getattr(getattr(msg, "created_at", None), "isoformat", lambda: None)(),
+                        "author_id": str(getattr(author, "id", "")),
+                    })
+        except Exception as exc:
+            logger.debug("[%s] Visible fork context export failed for %s: %s", self.name, thread_id, exc)
+            return []
+
+        rows.reverse()
+        return rows
 
     async def _fetch_channel_context(
         self,
@@ -7375,15 +7462,27 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
 
-        # First try: create a thread directly on the channel.
+        # First try: create a thread directly on the channel.  Discord forum
+        # channels require a starter post/content and discord.py may return a
+        # ThreadWithMessage wrapper instead of the raw Thread, so handle both
+        # shapes.  Text channels use the plain create_thread signature.
         try:
             create = getattr(parent, "create_thread", None)
             if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                )
+                if isinstance(parent, getattr(discord, "ForumChannel", ())):
+                    created = await create(
+                        name=thread_name,
+                        content=f"\U0001f9f5 Hermes handoff: **{thread_name}**",
+                        auto_archive_duration=1440,
+                        reason=reason,
+                    )
+                    thread = getattr(created, "thread", created)
+                else:
+                    thread = await create(
+                        name=thread_name,
+                        auto_archive_duration=1440,
+                        reason=reason,
+                    )
                 return str(thread.id)
         except Exception as direct_error:
             logger.debug(

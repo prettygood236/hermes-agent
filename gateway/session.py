@@ -3431,6 +3431,48 @@ class SessionStore:
 
         return new_entry
 
+    def bind_session(
+        self,
+        source: SessionSource,
+        target_session_id: str,
+        display_name: Optional[str] = None,
+    ) -> SessionEntry:
+        """Bind ``source`` to an existing session without a throwaway DB row.
+
+        ``switch_session()`` is correct when a destination key already exists;
+        it ends the old row for that key and reopens the target session.  A new
+        visible platform thread has no live key yet, so creating a temporary
+        timestamp session just to switch away from it leaves unnecessary DB
+        debris and lets the running gateway overwrite externally-added JSON
+        mappings.  This method records the in-memory + sessions.json binding
+        directly while preserving the source/original lane.
+        """
+        now = _now()
+        session_key = self._generate_session_key(source)
+        entry = SessionEntry(
+            session_key=session_key,
+            session_id=target_session_id,
+            created_at=now,
+            updated_at=now,
+            origin=source,
+            display_name=display_name if display_name is not None else source.chat_name,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            self._entries[session_key] = entry
+            self._save()
+
+        if self._db:
+            try:
+                self._db.reopen_session(target_session_id)
+            except Exception as e:
+                logger.debug("Session DB reopen_session failed: %s", e)
+
+        return entry
+
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
         """List all sessions, optionally filtered by activity."""
         with self._lock:

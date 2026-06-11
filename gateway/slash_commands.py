@@ -4963,6 +4963,696 @@ class GatewaySlashCommandsMixin:
             title=title,
         )
 
+    async def _handle_visible_fork_command(self, event: MessageEvent) -> str:
+        """Handle /fork <name> — fork into a new visible platform thread.
+
+        Unlike /branch, this keeps the current thread bound to the original
+        session and binds the newly-created thread to the child session inside
+        the live SessionStore.  That in-process bind is the continuity-critical
+        part: external JSON/DB patching alone can be overwritten by the running
+        gateway's in-memory session cache.
+        """
+        import uuid as _uuid
+        from datetime import datetime as _dt
+        from gateway.session import SessionSource
+
+        if not self._session_db:
+            from hermes_state import format_session_db_unavailable
+            return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
+
+        source = event.source
+        if source is None:
+            return "Visible fork failed: missing message source."
+
+        branch_title = event.get_command_args().strip()
+
+        if not source.thread_id:
+            return "Visible fork only works from an existing platform thread. Use /branch for internal session forks."
+
+        parent_chat_id = getattr(source, "parent_chat_id", None) or self._visible_fork_parent_chat_id(event)
+        if not parent_chat_id:
+            return "Visible fork failed: could not determine this thread's parent channel/forum."
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return f"Visible fork failed: platform {getattr(source.platform, 'value', source.platform)} is not active."
+
+        current_entry = await self.async_session_store.get_or_create_session(source)
+        parent_session_id = current_entry.session_id
+        history = await self.async_session_store.load_transcript(parent_session_id)
+        visible_history = await self._load_visible_fork_platform_context(
+            adapter=adapter,
+            source=source,
+            event=event,
+        )
+        parent_session_id, history = self._resolve_visible_fork_source_context(
+            source=source,
+            current_session_id=parent_session_id,
+            current_history=history,
+        )
+        history = self._merge_visible_fork_histories(history, visible_history)
+        if not history:
+            return "No conversation to fork — send a message first."
+
+        raw_history_count = len(history)
+        raw_estimated_tokens = self._estimate_visible_fork_history_tokens(history)
+        history, fork_mode, preflight_note = self._preflight_visible_fork_history(
+            history=history,
+            parent_session_id=parent_session_id,
+            estimated_tokens=raw_estimated_tokens,
+        )
+
+        if not branch_title:
+            sess_db = getattr(self, "_session_db", None)
+            base_title = (
+                getattr(source, "chat_name", None)
+                or (sess_db.get_session_title(parent_session_id) if sess_db else None)
+                or "Visible Fork"
+            )
+            base_title = " ".join(str(base_title).split()).strip()
+            # Gateway display names may include breadcrumb-style labels such as
+            # "AI Hub / work / Source Lane".  The fork title should use the
+            # current visible lane name, not the whole breadcrumb.
+            if " / " in base_title:
+                base_title = base_title.rsplit(" / ", 1)[-1].strip()
+            base_title = self._sanitize_visible_fork_title_base(base_title) or "Visible Fork"
+            suffix = " Fork"
+            if base_title.lower().endswith(" fork") or base_title.lower() == "fork":
+                branch_title = base_title[:80]
+            else:
+                branch_title = f"{base_title[:80 - len(suffix)].rstrip()}{suffix}"
+
+        create_thread = getattr(adapter, "create_handoff_thread", None)
+        if create_thread is None:
+            return "Visible fork failed: this platform adapter cannot create threads."
+        try:
+            new_thread_id = await create_thread(str(parent_chat_id), branch_title)
+        except Exception as exc:
+            logger.warning("Visible fork: thread creation failed: %s", exc, exc_info=True)
+            return f"Visible fork failed: could not create thread ({exc})."
+        if not new_thread_id:
+            return "Visible fork failed: platform did not create a new thread."
+        new_thread_id = str(new_thread_id)
+
+        now = _dt.now()
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+        platform_name = source.platform.value if source.platform else "gateway"
+        fork_metadata = {
+            "_branched_from": parent_session_id,
+            "_visible_fork_thread_id": new_thread_id,
+            "_fork_mode": fork_mode,
+            "_raw_source_session_id": parent_session_id,
+            "_raw_source_message_count": raw_history_count,
+            "_active_seed_message_count": len(history),
+            "_estimated_tokens_before_preflight": raw_estimated_tokens,
+        }
+        if preflight_note:
+            fork_metadata["_preflight_note"] = preflight_note
+        try:
+            self._session_db.create_session(
+                session_id=new_session_id,
+                source=platform_name,
+                user_id=source.user_id,
+                model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
+                model_config=fork_metadata,
+                parent_session_id=parent_session_id,
+            )
+        except Exception as exc:
+            logger.error("Visible fork: failed to create child session: %s", exc, exc_info=True)
+            return f"Visible fork failed: could not create child session ({exc}). New thread: <#{new_thread_id}>"
+
+        copied = 0
+        copy_errors = 0
+        expected_copied = len(history)
+        for msg in history:
+            try:
+                self._session_db.append_message(
+                    session_id=new_session_id,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                    tool_name=msg.get("tool_name") or msg.get("name"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
+                    token_count=msg.get("token_count"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning"),
+                    reasoning_content=msg.get("reasoning_content"),
+                    reasoning_details=msg.get("reasoning_details"),
+                    codex_reasoning_items=msg.get("codex_reasoning_items"),
+                    codex_message_items=msg.get("codex_message_items"),
+                    platform_message_id=msg.get("platform_message_id") or msg.get("message_id"),
+                    observed=bool(msg.get("observed", False)),
+                )
+                copied += 1
+            except Exception:
+                copy_errors += 1
+                logger.warning("Visible fork: failed to copy one message", exc_info=True)
+
+        if copied != expected_copied:
+            try:
+                self._session_db.end_session(new_session_id, "visible_fork_partial_copy")
+            except Exception:
+                pass
+            return (
+                f"Visible fork failed: copied only {copied}/{expected_copied} messages "
+                f"({copy_errors} error(s)). New thread: <#{new_thread_id}>. "
+                "The original thread remains unchanged."
+            )
+
+        try:
+            self._session_db.set_session_title(new_session_id, branch_title)
+        except Exception:
+            pass
+
+        fork_source = SessionSource(
+            platform=source.platform,
+            chat_id=new_thread_id,
+            chat_name=branch_title,
+            chat_type="thread",
+            user_id=source.user_id,
+            user_name=source.user_name,
+            thread_id=new_thread_id,
+            chat_topic=source.chat_topic,
+            user_id_alt=getattr(source, "user_id_alt", None),
+            guild_id=getattr(source, "guild_id", None),
+            parent_chat_id=str(parent_chat_id),
+        )
+        bound = await self.async_session_store.bind_session(
+            fork_source,
+            new_session_id,
+            display_name=branch_title,
+        )
+        fork_session_key = bound.session_key
+        self._clear_session_boundary_security_state(fork_session_key)
+        self._evict_cached_agent(fork_session_key)
+        self._release_running_agent_state(fork_session_key)
+
+        threads = getattr(adapter, "_threads", None)
+        mark = getattr(threads, "mark", None)
+        if mark:
+            try:
+                mark(new_thread_id)
+            except Exception:
+                pass
+
+        seed = (
+            f"⑂ Visible fork of <#{source.thread_id}>\n"
+            f"Parent session: `{parent_session_id}`\n"
+            f"Fork session: `{new_session_id}`\n"
+            f"Copied messages: {copied}\n\n"
+            "Continue here; the parent thread remains unchanged."
+        )
+        try:
+            send = getattr(adapter, "send", None)
+            if send is not None:
+                await send(chat_id=str(parent_chat_id), content=seed, metadata={"thread_id": new_thread_id})
+        except Exception:
+            logger.debug("Visible fork: seed send failed", exc_info=True)
+
+        try:
+            self._register_visible_fork_route_if_available(
+                source=source,
+                fork_source=fork_source,
+                title=branch_title,
+                parent_session_id=parent_session_id,
+                new_session_id=new_session_id,
+            )
+        except Exception:
+            logger.debug("Visible fork: optional route registration failed", exc_info=True)
+
+        mode_line = ""
+        if fork_mode != "exact_active_copy":
+            mode_line = f"Fork mode: `{fork_mode}`\nRaw source messages: {raw_history_count}\n"
+        return (
+            f"⑂ Visible fork created: <#{new_thread_id}> **{branch_title}**\n"
+            f"Original session: `{parent_session_id}`\n"
+            f"Fork session: `{new_session_id}`\n"
+            f"Copied messages: {copied}\n"
+            f"{mode_line}"
+            "The original thread remains on its original session."
+        )
+
+    async def _load_visible_fork_platform_context(
+        self,
+        *,
+        adapter: Any,
+        source: Any,
+        event: MessageEvent,
+    ) -> list[dict[str, Any]]:
+        """Ask a platform adapter for visible thread context at fork time.
+
+        The SQLite session transcript is the canonical agent memory, but a
+        durable gateway lane can drift to a stale/fresh session while the human
+        visible thread still contains the latest conversation. A Codex-style
+        fork must preserve that visible tail too. Adapters that can read their
+        own thread/channel history may expose
+        ``export_visible_fork_context(source=..., event=...)`` and return a
+        chronological list of OpenAI-style message dicts.
+        """
+        export = getattr(adapter, "export_visible_fork_context", None)
+        if export is None:
+            return []
+        try:
+            result = export(source=source, event=event)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:
+            logger.debug("Visible fork: platform context export failed", exc_info=True)
+            return []
+        if not isinstance(result, list):
+            return []
+        messages: list[dict[str, Any]] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if role not in {"user", "assistant", "system", "tool"}:
+                continue
+            content = item.get("content")
+            if content is None or str(content).strip() == "":
+                continue
+            msg = dict(item)
+            msg["role"] = role
+            msg["content"] = str(content)
+            messages.append(msg)
+        return messages
+
+    def _estimate_visible_fork_history_tokens(self, history: list[dict[str, Any]]) -> int:
+        """Cheap deterministic token estimate for fork preflight.
+
+        This is intentionally conservative and local: /fork must not call an LLM
+        before it knows whether the copied child will immediately hit hygiene
+        compression.  The estimate is only used to choose exact-copy vs curated
+        active seed; the raw transcript remains in the parent session either way.
+        """
+        import json
+
+        total_chars = 0
+        for msg in history or []:
+            try:
+                total_chars += len(json.dumps(msg.get("content", ""), ensure_ascii=False))
+            except Exception:
+                total_chars += len(str(msg.get("content", "")))
+            total_chars += 16
+        return max(1, total_chars // 4)
+
+    def _visible_fork_active_token_budget(self) -> int | None:
+        """Return the active-context budget for exact visible fork copies."""
+        cfg = self.config if isinstance(getattr(self, "config", None), dict) else {}
+        model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model", {}), dict) else {}
+        compression_cfg = cfg.get("compression", {}) if isinstance(cfg.get("compression", {}), dict) else {}
+        context_length = model_cfg.get("context_length") or model_cfg.get("max_context_tokens")
+        if context_length is None:
+            # Current large-context default used by the user's gpt-5.5/Codex
+            # runtime.  Keeping this high avoids touching normal small forks
+            # while still preventing known 400k-token recovered lanes from
+            # exploding on their first child turn.
+            context_length = 272_000
+        try:
+            context_length = int(context_length)
+        except (TypeError, ValueError):
+            return None
+        if context_length <= 0:
+            return None
+        try:
+            threshold = float(compression_cfg.get("threshold", 0.85))
+        except (TypeError, ValueError):
+            threshold = 0.85
+        threshold = min(max(threshold, 0.05), 1.0)
+        return int(context_length * threshold)
+
+    def _preflight_visible_fork_history(
+        self,
+        *,
+        history: list[dict[str, Any]],
+        parent_session_id: str,
+        estimated_tokens: int,
+    ) -> tuple[list[dict[str, Any]], str, str | None]:
+        """Choose exact vs curated active seed before creating the fork.
+
+        Oversized recovered lanes should not copy a raw transcript into the
+        active child only to auto-compress on the first real turn.  Instead, keep
+        an exact raw source pointer in metadata and seed the child with anchors,
+        a deterministic audit note, and the recent tail.
+        """
+        budget = self._visible_fork_active_token_budget()
+        if not budget or estimated_tokens <= budget:
+            return list(history or []), "exact_active_copy", None
+
+        cfg = self.config if isinstance(getattr(self, "config", None), dict) else {}
+        compression_cfg = cfg.get("compression", {}) if isinstance(cfg.get("compression", {}), dict) else {}
+        try:
+            protect_first = int(compression_cfg.get("protect_first_n", 3))
+        except (TypeError, ValueError):
+            protect_first = 3
+        try:
+            protect_last = int(compression_cfg.get("protect_last_n", 20))
+        except (TypeError, ValueError):
+            protect_last = 20
+        protect_first = max(0, protect_first)
+        protect_last = max(1, protect_last)
+
+        source = list(history or [])
+        first = source[:protect_first]
+        tail_start = max(protect_first, len(source) - protect_last)
+        tail = source[tail_start:]
+        omitted = max(0, len(source) - len(first) - len(tail))
+        note = {
+            "role": "assistant",
+            "content": (
+                "Visible fork preflight: source transcript exceeded the active "
+                "context budget, so this child starts from a curated active "
+                "seed. The exact raw source remains preserved in parent session "
+                f"`{parent_session_id}`. "
+                f"raw_messages={len(source)}, active_seed_messages={len(first) + 1 + len(tail)}, "
+                f"omitted_middle_messages={omitted}, estimated_tokens={estimated_tokens}, budget={budget}."
+            ),
+        }
+        return first + [note] + tail, "curated_active_with_raw_archive", note["content"]
+
+    def _visible_fork_message_identity(self, msg: dict[str, Any]) -> tuple[str, str] | None:
+        message_id = msg.get("platform_message_id") or msg.get("message_id")
+        if message_id:
+            return ("id", str(message_id))
+        return None
+
+    def _merge_visible_fork_histories(
+        self,
+        base_history: list[dict[str, Any]],
+        visible_history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge persisted agent memory with visible platform tail messages."""
+        merged = list(base_history or [])
+        if not visible_history:
+            return merged
+        seen: set[tuple[str, str]] = set()
+        for msg in merged:
+            identity = self._visible_fork_message_identity(msg)
+            if identity is not None:
+                seen.add(identity)
+                continue
+            role = str(msg.get("role") or "")
+            content = str(msg.get("content") or "").strip()
+            if content:
+                seen.add(("content", f"{role}\0{content}"))
+        appended = 0
+        for msg in visible_history:
+            role = str(msg.get("role") or "")
+            content = str(msg.get("content") or "").strip()
+            identity = self._visible_fork_message_identity(msg)
+            key = identity or ("content", f"{role}\0{content}")
+            if not content or key in seen:
+                continue
+            seen.add(key)
+            merged.append(msg)
+            appended += 1
+        if appended:
+            logger.info(
+                "Visible fork: appended %d visible platform message(s) to copied context",
+                appended,
+            )
+        return merged
+
+    def _sanitize_visible_fork_title_base(self, value: Any) -> str:
+        """Return a human title base without channel mention/hashtag chrome."""
+        base = " ".join(str(value or "").split()).strip()
+        if " / " in base:
+            base = base.rsplit(" / ", 1)[-1].strip()
+        return base.strip(" -·—|/#")
+
+    def _resolve_visible_fork_source_context(
+        self,
+        *,
+        source: Any,
+        current_session_id: str,
+        current_history: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Return the best source session/history for a visible fork.
+
+        Durable lanes can briefly point at a fresh timestamp session after
+        reset/cache drift even though a route registry still knows the real live
+        head. A Codex-style visible fork should branch from the lane context,
+        not from an empty route-slip shell. Prefer the current live session when
+        it has at least as much context; otherwise fall back to the durable
+        route/head for this thread when that route has a richer transcript.
+        """
+        best_session_id = current_session_id
+        best_history = list(current_history or [])
+
+        for candidate in self._visible_fork_source_session_candidates(source):
+            if not candidate or candidate == best_session_id:
+                continue
+            try:
+                candidate_history = getattr(self, "session_store").load_transcript(candidate)
+            except Exception:
+                candidate_history = []
+            if not candidate_history:
+                continue
+            if len(candidate_history) > len(best_history):
+                merged_history = list(candidate_history)
+                if current_session_id != candidate and current_history:
+                    merged_history.extend(list(current_history))
+                logger.info(
+                    "Visible fork: using durable lane context %s (%d msgs, merged=%d) instead of current %s (%d msgs)",
+                    candidate,
+                    len(candidate_history),
+                    len(merged_history),
+                    best_session_id,
+                    len(best_history),
+                )
+                best_session_id = candidate
+                best_history = merged_history
+
+        return best_session_id, best_history
+
+    def _visible_fork_source_session_candidates(self, source: Any) -> list[str]:
+        """Best-effort durable session candidates for a fork source.
+
+        Stock Hermes needs only the current SessionStore entry. Some gateway
+        deployments also maintain route registries that survive thread moves,
+        resets, and live-head repairs. Read those registries opportunistically
+        so /fork branches from the durable lane head when the current session
+        key has drifted to a fresh timestamp session.
+        """
+        try:
+            platform_name = getattr(getattr(source, "platform", None), "value", "")
+        except Exception:
+            platform_name = ""
+        if platform_name != "discord":
+            return []
+
+        thread_id = str(getattr(source, "thread_id", "") or getattr(source, "chat_id", "") or "")
+        if not thread_id:
+            return []
+
+        import json
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: Any) -> None:
+            if value is None:
+                return
+            sid = str(value).strip()
+            if not sid or sid in seen:
+                return
+            seen.add(sid)
+            candidates.append(sid)
+
+        def iter_entries(obj: Any):
+            if isinstance(obj, dict):
+                for value in obj.values():
+                    if isinstance(value, dict):
+                        yield value
+            elif isinstance(obj, list):
+                for value in obj:
+                    if isinstance(value, dict):
+                        yield value
+
+        def read_json(path: Path) -> Any:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+
+        # Newest/most explicit durable live-head map wins when present.
+        heads = read_json(home / "lane_heads.json")
+        if isinstance(heads, dict):
+            for entry in iter_entries(heads.get("lanes")):
+                if str(entry.get("discord_thread_id") or entry.get("thread_id") or "") == thread_id:
+                    add(entry.get("head_session_id"))
+                    add(entry.get("current_hermes_session_id"))
+                    add(entry.get("stable_session_id"))
+
+        routes = read_json(home / "discord_routes.json")
+        if isinstance(routes, dict):
+            for entry in iter_entries(routes.get("routes", routes)):
+                if str(entry.get("discord_thread_id") or entry.get("thread_id") or "") == thread_id:
+                    add(entry.get("head_session_id"))
+                    add(entry.get("current_hermes_session_id"))
+                    add(entry.get("stable_session_id"))
+
+        para_map = read_json(home / "memory" / "para-session-map.json")
+        if isinstance(para_map, dict):
+            for entry in iter_entries(para_map.get("sessions", para_map)):
+                discord_route = None
+                routes_obj = entry.get("platform_routes")
+                if isinstance(routes_obj, dict):
+                    discord_route = routes_obj.get("discord")
+                if isinstance(discord_route, dict):
+                    route_thread_id = str(
+                        discord_route.get("thread_id")
+                        or discord_route.get("discord_thread_id")
+                        or ""
+                    )
+                else:
+                    route_thread_id = str(entry.get("discord_thread_id") or entry.get("thread_id") or "")
+                if route_thread_id == thread_id:
+                    add(entry.get("head_session_id"))
+                    add(entry.get("current_hermes_session_id"))
+                    add(entry.get("stable_session_id"))
+
+        return candidates
+
+    def _visible_fork_parent_chat_id(self, event: MessageEvent) -> Optional[str]:
+        """Best-effort parent channel/forum id extraction from platform raw objects."""
+        raw = getattr(event, "raw_message", None)
+        channel = getattr(raw, "channel", None)
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id:
+            return str(parent_id)
+        parent = getattr(channel, "parent", None)
+        parent_id = getattr(parent, "id", None)
+        if parent_id:
+            return str(parent_id)
+        return None
+
+    def _register_visible_fork_route_if_available(
+        self,
+        *,
+        source: Any,
+        fork_source: Any,
+        title: str,
+        parent_session_id: str,
+        new_session_id: str,
+    ) -> None:
+        """Optional local PARA/Discord route registration for AI Hub installs.
+
+        Stock Hermes only needs SessionStore + SessionDB for continuity.  This
+        user's Discord/PARA setup also keeps auxiliary router/index files.  If
+        they exist, add non-destructive fork entries so #home routing and target
+        listings can discover the new thread.  Missing files are ignored so the
+        command remains portable.
+        """
+        import json
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        platform_name = getattr(getattr(fork_source, "platform", None), "value", "discord")
+        if platform_name != "discord":
+            return
+        thread_id = str(getattr(fork_source, "thread_id", "") or "")
+        if not thread_id:
+            return
+        now = datetime.now().isoformat()
+        stable = new_session_id
+        parent_thread = str(getattr(source, "thread_id", "") or "")
+        parent_channel = str(getattr(fork_source, "parent_chat_id", "") or "")
+
+        def _load(path: Path, default: Any) -> Any:
+            if not path.exists():
+                return default
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return default
+
+        def _save(path: Path, data: Any) -> None:
+            atomic_json_write(path, data)
+
+        routes_path = home / "discord_routes.json"
+        if routes_path.exists():
+            data = _load(routes_path, {"routes": {}})
+            data.setdefault("routes", {})[stable] = {
+                "stable_session_id": stable,
+                "current_hermes_session_id": new_session_id,
+                "discord_thread_id": thread_id,
+                "parent_thread_id": parent_thread,
+                "bucket": "4_ARCHIVES",
+                "status": "visible_fork",
+                "title": title,
+                "aliases": [title, stable],
+                "scope_note": "Visible fork created by Gateway /fork; parent thread remains unchanged.",
+                "updated_at": now,
+            }
+            data["updated_at"] = now
+            _save(routes_path, data)
+
+        registry_path = home / "memory" / "para-session-map.json"
+        if registry_path.exists():
+            data = _load(registry_path, {"sessions": {}})
+            data.setdefault("sessions", {})[stable] = {
+                "stable_session_id": stable,
+                "current_hermes_session_id": new_session_id,
+                "display_name": title,
+                "current_bucket": "4_ARCHIVES",
+                "status": "visible_fork",
+                "aliases": [title, stable],
+                "parent_stable_session_id": parent_session_id,
+                "platform_routes": {"discord": {
+                    "thread_id": thread_id,
+                    "parent_channel_id": parent_channel,
+                    "title": title,
+                    "status": "visible_fork",
+                    "updated_at": now,
+                }},
+                "move_history": [{
+                    "action": "visible_fork",
+                    "at": now,
+                    "parent_session_id": parent_session_id,
+                    "parent_thread_id": parent_thread,
+                    "thread_id": thread_id,
+                }],
+                "updated_at": now,
+            }
+            data["updated_at"] = now
+            _save(registry_path, data)
+
+        router_path = home / "ai_hub_home_router.json"
+        if router_path.exists():
+            data = _load(router_path, {"routes": {}})
+            data.setdefault("routes", {})[title] = thread_id
+            data["routes"][stable] = thread_id
+            data["updated_at"] = now
+            _save(router_path, data)
+
+        threads_path = home / "discord_threads.json"
+        if threads_path.exists():
+            data = _load(threads_path, [])
+            if isinstance(data, list) and thread_id not in data:
+                data.append(thread_id)
+                _save(threads_path, data)
+
+        heads_path = home / "lane_heads.json"
+        if heads_path.exists():
+            data = _load(heads_path, {"version": 1, "lanes": {}})
+            data.setdefault("lanes", {})[stable] = {
+                "stable_session_id": stable,
+                "platform": "discord",
+                "thread_id": thread_id,
+                "discord_thread_id": thread_id,
+                "head_session_id": new_session_id,
+                "parent_stable_session_id": parent_session_id,
+                "status": "visible_fork",
+                "revision": 1,
+                "updated_at": now,
+                "reason": "gateway_visible_fork",
+            }
+            _save(heads_path, data)
+
+
     async def _handle_branch_command(self, event: MessageEvent) -> str:
         """Handle /branch [name] — fork the current session into a new independent copy.
 
