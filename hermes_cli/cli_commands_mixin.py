@@ -2031,8 +2031,9 @@ class CLICommandsMixin:
         directory, a URL, "what we just did", pasted notes. We build a
         standards-guided prompt and inject it onto the agent's input queue; the
         live agent gathers the material with the tools it already has and
-        authors the skill via ``skill_manage``. No engine, no model-tool
-        footprint, works on any terminal backend.
+        updates or creates skill material via ``skill_manage``, preferring
+        existing skills first. No engine, no model-tool footprint, works on any
+        terminal backend.
         """
         from agent.learn_prompt import build_learn_prompt
 

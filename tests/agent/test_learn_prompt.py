@@ -21,7 +21,65 @@ class TestBuildLearnPrompt:
         assert req in prompt
 
 
+    def test_instructs_using_skill_manage_for_skill_updates(self):
+        prompt = build_learn_prompt("learn the thing")
+        assert "skill_manage" in prompt
 
+    def test_learn_is_patch_first_not_create_first(self):
+        prompt = build_learn_prompt("learn the thing")
+        low = prompt.lower()
+
+        assert "skills_list" in prompt
+        assert "skill_view" in prompt
+        assert "skill_manage" in prompt
+
+        assert "patch" in low
+        assert "write_file" in low
+        assert "unresolved" in low
+
+        assert "Author ONE SKILL.md" not in prompt
+        assert 'action="create"' not in prompt
+
+    def test_create_is_last_resort_only(self):
+        prompt = build_learn_prompt("learn a brand new workflow")
+        low = prompt.lower()
+
+        assert "create" in low
+        assert "only if no existing skill covers the class" in low
+        assert "if unsure" in low
+        assert "do not create" in low
+
+    def test_learn_save_quality_gate_matches_user_policy(self):
+        prompt = build_learn_prompt("learn from a verified workflow")
+        required_phrases = (
+            "Capture only 100%-successful, concrete procedures",
+            "Failure or negative-history notes are allowed only when they are necessary",
+            "Place the smallest necessary text in the necessary location only",
+            "Do not duplicate existing guidance",
+            "Trigger / Procedure / Verification",
+            "CREATE only if no existing skill covers the class",
+            "If the fit is ambiguous, do not create; report UNRESOLVED",
+            "First classify the learning's scope and canonical owner",
+            "A skill being currently loaded or used does NOT make it the owner",
+            "Use the minimum sufficient instructions and verification gates",
+            "Every gate must block a distinct realistic failure or prove a required invariant",
+            "do not equate gate count with quality",
+            "Minimize context, tool calls, time, memory, and mutable state",
+        )
+        for phrase in required_phrases:
+            assert phrase in prompt
+
+    def test_patch_first_decision_labels_are_present(self):
+        prompt = build_learn_prompt("learn from what we just did")
+        for label in ("PATCH", "MERGE", "CREATE", "REJECT", "UNRESOLVED"):
+            assert label in prompt
+
+    def test_references_gather_tools_for_open_ended_sourcing(self):
+        # Open-ended sourcing relies on the agent's own tools, named so it
+        # knows dirs/URLs/conversation/paste all route through existing tools.
+        prompt = build_learn_prompt("learn from somewhere")
+        for tool in ("read_file", "search_files", "web_extract"):
+            assert tool in prompt
 
     def test_separates_sources_from_requirements(self):
         # The reported bug (@GrenFX, Jun 2026): when a request leads with a

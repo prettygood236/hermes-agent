@@ -94,12 +94,11 @@ hermes chat --toolsets skills -q "Show me the axolotl skill"
 ## Learning a skill from sources (`/learn`)
 
 `/learn` is the fast way to turn something you already know — or a pile of
-reference material — into a reusable skill, without hand-writing the
+reference material — into reusable skill knowledge, without hand-writing the
 `SKILL.md`. It is open-ended: point it at *anything you can describe* and the
-agent gathers the material with the tools it already has, then authors a skill
-that follows the [house authoring standards](#skillmd-format) (≤60-char
-description, the standard section order, Hermes-tool framing, no invented
-commands).
+agent gathers the material with the tools it already has, then checks existing
+skills before writing. It prefers patching the best existing skill or reference,
+and creates a new skill only when no existing class-level skill fits.
 
 ```bash
 # A local SDK or doc directory — read with read_file / search_files
@@ -142,9 +141,12 @@ with a directory field, a URL field, and an open-ended text box; it composes a
 `/learn` request and runs it in chat.
 
 There is no model-tool footprint: `/learn` builds a standards-guided prompt and
-hands it to the agent as a normal turn. The agent saves the result with the
-`skill_manage` tool, so the [write-approval gate](#gating-agent-skill-writes-skillswrite_approval)
-applies if you have it on.
+hands it to the agent as a normal turn. The agent uses `skills_list` and
+`skill_view` to inspect existing skills, then uses `skill_manage` to patch,
+write a supporting reference/template/script, or — as a last resort — create a
+new skill. The [write-approval gate](#gating-agent-skill-writes-skillswrite_approval)
+applies if you have it on. If the learning is unverified or no clear home fits,
+`/learn` may report `UNRESOLVED` instead of writing.
 
 ## Progressive Disclosure
 

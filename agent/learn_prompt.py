@@ -11,13 +11,11 @@ that instructs the live agent to:
      (``read_file`` / ``search_files`` for dirs, ``web_extract`` for URLs, the
      current conversation for "what I just did", the user's text for pasted
      material).
-  2. Author a skill via ``skill_manage`` that follows the Hermes
-     skill-authoring standards (description <=60 chars, the modern section
-     order, Hermes-tool framing, no invented commands). Small sources get one
-     tight SKILL.md; large prose sources (books, paper stacks, specs, doc
-     corpora) get the knowledge-base layout — a lean SKILL.md index plus
-     per-chapter ``references/`` files loaded on demand via ``skill_view``
-     (the shape popularized by virgiliojr94/book-to-skill).
+  2. Inspect existing skills first and prefer PATCH or MERGE over CREATE,
+     then author the smallest necessary change via ``skill_manage`` under the
+     Hermes skill-authoring standards. Small sources get one tight SKILL.md;
+     large prose sources get a lean SKILL.md index plus on-demand
+     ``references/`` files.
 
 There is no separate distillation engine and no model-tool footprint: the
 agent does the work with its existing toolset, so this works identically on
@@ -181,9 +179,17 @@ def build_learn_prompt(user_request: str) -> str:
             "the steps taken and distill them into a reusable skill"
         )
 
+    existing_skill_hint = ""
+    if "skill" in req.lower():
+        existing_skill_hint = (
+            " First check the available skills. If one exists, load it with "
+            "`skill_view`. Only when no matching skill exists, create one with "
+            "`skill_manage` action=\"create\".\n"
+        )
+
     return (
-        "[/learn] The user wants you to learn a reusable skill from the "
-        "request below, and save it.\n\n"
+        "[/learn] The user wants you to learn reusable skill knowledge from "
+        "the request below, and save the change if warranted.\n\n"
         f"THE REQUEST:\n{req}\n\n"
         "The request is open-ended and may mix two kinds of content, in any "
         "order: SOURCES to gather (directories, file paths, URLs, \"what we "
@@ -207,17 +213,47 @@ def build_learn_prompt(user_request: str) -> str:
         "If the request is ambiguous about scope, make a reasonable choice "
         "and note it; do not stall.\n"
         "1b. Apply every requirement, focus, and constraint in the request to "
-        "the skill you author — these govern what the SKILL.md covers and "
-        "emphasizes, not just which sources you read.\n"
-        "2. Save the skill with `skill_manage`. First check the available "
-        "skills for one covering this source or topic. If one exists, load it "
-        "with `skill_view`, then extend its SKILL.md with `skill_manage` patch "
-        "(or edit for a necessary full rewrite) and add or update supporting "
-        "files with `skill_manage` write_file. Only when no matching skill "
-        "exists, create one with `skill_manage` action=\"create\" and pick a "
-        "sensible category. If the procedure needs a non-trivial script, add "
-        "it under the skill's `scripts/` with `skill_manage` write_file and "
-        "reference it by relative path.\n"
+        "the skill material you update or create — these govern what the "
+        "skill/reference covers and emphasizes, not just which sources you read.\n"
+        "2. Before writing, inspect existing skills with `skills_list` and "
+        "`skill_view`. Decide one of: PATCH, MERGE, CREATE, REJECT, or "
+        "UNRESOLVED. First classify the learning's scope and canonical owner: "
+        "cross-cutting principles belong to the class-level umbrella or its "
+        "canonical reference; domain-specific procedures belong to that domain; "
+        "incident details stay out unless needed as a reusable failure mode. "
+        "A skill being currently loaded or used does NOT make it the owner. "
+        "Prefer this order:\n"
+        "   1. PATCH the currently relevant skill only when it already owns the "
+        "full scope of the learning.\n"
+        "   2. PATCH an existing class-level umbrella skill.\n"
+        "   3. MERGE by adding or updating a reference/template/script under an "
+        "existing umbrella with `skill_manage` patch or write_file.\n"
+        "   4. CREATE only if no existing skill covers the class and the "
+        "learning has its own routing trigger, prerequisites, verification "
+        "contract, or distinct failure mode.\n"
+        "   If unsure, do not create a skill; report UNRESOLVED and explain "
+        "what evidence is missing. If the fit is ambiguous, do not create; "
+        "report UNRESOLVED.\n"
+        f"{existing_skill_hint}"
+        "2a. Apply this save-quality gate before any `skill_manage` call:\n"
+        "   - Capture only 100%-successful, concrete procedures as Procedure.\n"
+        "   - Failure or negative-history notes are allowed only when they are necessary "
+        "to prevent repeating a tempting wrong path; label them as "
+        "Pitfalls/failure modes, not Procedure.\n"
+        "   - Place the smallest necessary text in the necessary location only: "
+        "existing SKILL.md body, `references/`, `templates/`, or `scripts/` "
+        "as appropriate.\n"
+        "   - Do not duplicate existing guidance; patch or replace stale wording "
+        "instead.\n"
+        "   - Write updates so the next LLM can execute them immediately as "
+        "Trigger / Procedure / Verification: when to use it, exact steps to "
+        "run, and a deterministic check that proves it worked.\n"
+        "   - Use the minimum sufficient instructions and verification gates. "
+        "Every gate must block a distinct realistic failure or prove a required "
+        "invariant; merge or remove overlapping gates. Do not trade away "
+        "completeness, security, recovery, or deterministic proof, but do not "
+        "equate gate count with quality. Minimize context, tool calls, time, "
+        "memory, and mutable state while preserving the full successful service.\n"
         "2b. Pick the shape by the source, not by habit: a workflow or small "
         "source gets ONE tight SKILL.md; a book, paper stack, spec, or large "
         "docs corpus gets the knowledge-base layout below — a lean SKILL.md "

@@ -581,7 +581,8 @@ def _(rid, params: dict) -> dict:
         # Open-ended: build the standards-guided prompt and submit it as a
         # normal agent turn. The live agent gathers whatever the user
         # described (dirs, URLs, this conversation, pasted text) with its own
-        # tools and authors the skill via skill_manage. Works on any backend.
+        # tools and updates or creates skill material via skill_manage,
+        # preferring existing skills first. Works on any backend.
         from agent.learn_prompt import build_learn_prompt
 
         return _ok(rid, {"type": "send", "message": build_learn_prompt(arg)})

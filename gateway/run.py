@@ -16965,8 +16965,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Open-ended: rewrite the turn to a standards-guided prompt and fall
             # through to normal agent processing. The live agent gathers the
             # sources the user described (dirs via read_file, URLs via
-            # web_extract, this conversation, pasted text) and authors the skill
-            # via skill_manage. Mirrors the /blueprint fall-through so role
+            # web_extract, this conversation, pasted text) and updates or
+            # creates skill material via skill_manage, preferring existing
+            # skills first. Mirrors the /blueprint fall-through so role
             # alternation is preserved. No engine, works on any backend.
             from agent.learn_prompt import build_learn_prompt
 
