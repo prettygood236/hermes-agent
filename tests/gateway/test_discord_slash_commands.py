@@ -602,3 +602,57 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_run_simple_slash_visible_invocation_keeps_public_marker(adapter):
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, name="Planner", display_name="Planner"),
+        channel=SimpleNamespace(id=456, name="plans", guild=SimpleNamespace(name="Guild")),
+        channel_id=456,
+        guild_id=789,
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(return_value=SimpleNamespace(id=999)),
+    )
+    adapter.handle_message = AsyncMock()
+
+    await adapter._run_simple_slash(
+        interaction,
+        "/plan Draft @everyone `launch`",
+        visible_invocation=True,
+    )
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=False)
+    interaction.edit_original_response.assert_awaited_once()
+    marker = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "Planner invoked" in marker
+    assert "@​" in marker
+    assert "ˋlaunchˋ" in marker
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_id == "999"
+    assert event.source.message_id == "999"
+    assert event.metadata["discord_visible_slash_invocation"] is True
+
+
+@pytest.mark.asyncio
+async def test_skill_plan_uses_visible_invocation(adapter, monkeypatch):
+    from hermes_cli import commands as command_module
+
+    monkeypatch.setattr(
+        command_module,
+        "discord_skill_commands_by_category",
+        lambda reserved_names=None: ({}, [("plan", "Plan mode", "/plan")], 0),
+    )
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    skill_cmd = adapter._client.tree.commands["skill"]
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await skill_cmd.callback(interaction, name="plan", args="build the release note")
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/plan build the release note",
+        visible_invocation=True,
+    )

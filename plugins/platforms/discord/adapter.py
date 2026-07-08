@@ -5798,11 +5798,34 @@ class DiscordAdapter(BasePlatformAdapter):
             return content
         return convert_table_to_bullets(content)
 
+
+    def _format_visible_slash_invocation(
+        self,
+        interaction: discord.Interaction,
+        command_text: str,
+    ) -> str:
+        """Return a safe public marker for a content-bearing slash invocation."""
+        user = getattr(interaction, "user", None)
+        display_name = (
+            getattr(user, "display_name", None)
+            or getattr(user, "name", None)
+            or "User"
+        )
+        display_name = str(display_name).replace("@", "@​")[:80]
+        safe_command = str(command_text or "").replace("`", "ˋ")
+        # Do not let a user prompt inside /plan ping everyone when we echo it.
+        safe_command = safe_command.replace("@", "@​")
+        if len(safe_command) > 1800:
+            safe_command = safe_command[:1797] + "..."
+        return f"💬 **{display_name} invoked:** `{safe_command}`"
+
     async def _run_simple_slash(
         self,
         interaction: discord.Interaction,
         command_text: str,
         followup_msg: str | None = None,
+        *,
+        visible_invocation: bool = False,
     ) -> None:
         """Common handler for simple slash commands that dispatch a command string.
 
@@ -5810,6 +5833,13 @@ class DiscordAdapter(BasePlatformAdapter):
         then cleans up the deferred response.  If *followup_msg* is provided
         the "thinking..." indicator is replaced with that text; otherwise it
         is deleted so the channel isn't cluttered.
+
+        For content-bearing skill slash invocations such as ``/skill plan``, set
+        ``visible_invocation=True``. Discord application-command invocations are
+        not normal channel messages; with an ephemeral defer + delete, the
+        user's prompt disappears from the visible transcript. The visible path
+        turns the interaction response into a public, stable invocation marker
+        and anchors the assistant reply to it.
         """
         # Log the invoker so ghost-command reports can be triaged.  Discord
         # native slash invocations are always user-initiated (no bot can fire
@@ -5836,7 +5866,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         deferred_response = False
         try:
-            await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=not visible_invocation)
             deferred_response = True
         except Exception as e:
             if not self._is_discord_unknown_interaction(e):
@@ -5846,9 +5876,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 "Executing command anyway, skipping interaction followup.",
                 command_text,
             )
-        event = self._build_slash_event(interaction, command_text)
+
+        visible_message_id: Optional[str] = None
+        if deferred_response and visible_invocation:
+            try:
+                marker = self._format_visible_slash_invocation(interaction, command_text)
+                marker_msg = await interaction.edit_original_response(content=marker)
+                visible_message_id = str(getattr(marker_msg, "id", "") or "") or None
+            except Exception as e:
+                logger.debug("Discord visible slash marker failed: %s", e)
+
+        event = self._build_slash_event(
+            interaction,
+            command_text,
+            message_id=visible_message_id,
+            visible_invocation=visible_invocation,
+        )
         await self.handle_message(event)
-        if not deferred_response:
+        if visible_invocation or not deferred_response:
             return
         try:
             if followup_msg:
@@ -6043,9 +6088,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 def _make_args_handler(__name: str, __hint: str):
                     @discord.app_commands.describe(args=f"Arguments: {__hint}"[:100])
                     async def _handler(interaction: discord.Interaction, args: str = ""):
-                        await self._run_simple_slash(
-                            interaction, f"/{__name} {args}".strip()
-                        )
+                        command_text = f"/{__name} {args}".strip()
+                        if __name == "plan":
+                            await self._run_simple_slash(
+                                interaction,
+                                command_text,
+                                visible_invocation=True,
+                            )
+                        else:
+                            await self._run_simple_slash(interaction, command_text)
                     _handler.__name__ = f"auto_slash_{__name.replace('-', '_')}"
                     return _handler
 
@@ -6324,9 +6375,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                     return
                 _desc, cmd_key = entry
-                await self._run_simple_slash(
-                    interaction, f"{cmd_key} {args}".strip()
-                )
+                command_text = f"{cmd_key} {args}".strip()
+                if cmd_key == "/plan":
+                    await self._run_simple_slash(
+                        interaction,
+                        command_text,
+                        visible_invocation=True,
+                    )
+                else:
+                    await self._run_simple_slash(interaction, command_text)
 
             cmd = discord.app_commands.Command(
                 name="skill",
@@ -6405,7 +6462,14 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         return (len(self._skill_entries), self._skill_group_hidden_count)
 
-    def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
+    def _build_slash_event(
+        self,
+        interaction: discord.Interaction,
+        text: str,
+        *,
+        message_id: Optional[str] = None,
+        visible_invocation: bool = False,
+    ) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
         is_dm = isinstance(interaction.channel, discord.DMChannel)
         is_thread = isinstance(interaction.channel, discord.Thread)
@@ -6438,6 +6502,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             chat_topic=chat_topic,
             parent_chat_id=str(getattr(interaction.channel, "parent_id", "") or "") or None,
+            message_id=message_id,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -6448,7 +6513,9 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=interaction,
+            message_id=message_id,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            metadata={"discord_visible_slash_invocation": visible_invocation},
         )
 
     # ------------------------------------------------------------------

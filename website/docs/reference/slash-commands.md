@@ -286,6 +286,8 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/help` | Show messaging help. |
 | `/<skill-name>` | Invoke any installed skill by name. |
 
+Discord note: `/skill plan` publishes a short visible invocation marker before Hermes answers, so the plan prompt remains readable in the channel transcript instead of disappearing into an ephemeral slash interaction.
+
 ## Notes
 
 - `/skin`, `/snapshot`, `/export`, `/import`, `/reload`, `/tools`, `/toolsets`, `/browser`, `/config`, `/cron`, `/platforms`, `/paste`, `/image`, `/statusbar`, `/battery`, `/focus`, `/plugins`, `/busy`, `/indicator`, `/wake`, `/journey`, `/redraw`, `/clear`, `/history`, `/save`, `/copy`, `/handoff`, `/prompt`, `/pet`, `/hatch`, `/timestamps`, `/subscription`, and `/quit` are **CLI-only** commands.
