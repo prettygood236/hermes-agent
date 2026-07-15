@@ -17104,6 +17104,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 detail=_undo_detail,
                 execute=_do_undo,
             )
+
+        if canonical == "rewind":
+            return await self._handle_rewind_command(event)
         
         if canonical == "sethome":
             return await self._handle_set_home_command(event)

@@ -161,6 +161,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[initial text]", aliases=("compose",)),
     CommandDef("undo", "Back up N user turns and re-prompt (default 1)", "Session",
                args_hint="[N]"),
+    CommandDef("rewind", "Back up history and best-effort delete visible gateway messages", "Session",
+               aliases=("undo-visible", "undo-discord"), gateway_only=True,
+               args_hint="[N] [bot-only|keep-user|dry-run]"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
@@ -1348,7 +1351,15 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform"})
+#   - rewind (+ visible-undo aliases): low-frequency cleanup surface; keep it
+#     reachable through /hermes on Slack rather than spending scarce native slots.
+#   - fork: visible thread forking is Discord-specific; keep the Slack fallback
+#     reachable through /hermes fork without displacing an existing native slash.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+    "heartbeat", "refine", "pause", "whoami", "platform", "fork", "rewind",
+    "undo-visible", "undo-discord",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

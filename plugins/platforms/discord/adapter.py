@@ -77,6 +77,9 @@ _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DISCORD_REWIND_BOT_ONLY_MAX_AGE_SECONDS = 15 * 60
+_DISCORD_REWIND_BOT_ONLY_GAP_SECONDS = 5 * 60
+_DISCORD_ROUTED_USER_TURN_PREFIX = "↪ Routed user turn"
 # Discord enforces a hard cap of 100 global application (slash) commands per
 # app. Registering more makes the ENTIRE sync fail with error 30032
 # ("Maximum number of application commands reached"), which silently breaks
@@ -107,6 +110,8 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"^\s*⏳\s+Working\s+—\s+\d+\s+min(?:\s|$)", re.IGNORECASE),
+    re.compile(r"^\s*📚\s+Reading\s+skill\s+\S[\s\S]*$", re.IGNORECASE),
+    re.compile(r"^\s*📋\s+Updating\s+tasks\b[\s\S]*$", re.IGNORECASE),
     re.compile(
         r"^\s*\[Background process\s+\S+\s+"
         r"(?:finished with exit code|is still running~)[\s\S]*\]\s*$",
@@ -391,6 +396,27 @@ def _looks_like_nonconversational_history_message(content: str) -> bool:
     """Fallback recognizer for legacy status bumps missing persisted IDs."""
     text = content or ""
     return any(pattern.match(text) for pattern in _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS)
+
+
+def _looks_like_cron_delivery_history_message(content: str) -> bool:
+    """Return True for scheduler deliveries that are independent visible artifacts."""
+    return bool(re.match(r"^\s*Cronjob Response:\s+\S[\s\S]*$", content or ""))
+
+
+def _routed_user_turn_payload(content: str) -> Optional[str]:
+    """Extract the original prompt from a bot-authored routed-user marker.
+
+    Routers can dispatch a synthetic user event directly into the Gateway, so
+    the destination Discord thread otherwise contains only bot-authored output.
+    The visible marker gives /rewind a durable semantic turn boundary without
+    pretending that the bot message was authored by the Discord user.
+    """
+    text = (content or "").strip()
+    if not text.startswith(_DISCORD_ROUTED_USER_TURN_PREFIX):
+        return None
+    _header, separator, payload = text.partition("\n\n")
+    payload = payload.strip() if separator else ""
+    return payload or None
 
 
 def _clean_discord_id(entry: str) -> str:
@@ -6958,6 +6984,281 @@ class DiscordAdapter(BasePlatformAdapter):
 
         rows.reverse()
         return rows
+
+
+    async def rewind_visible_turns(
+        self,
+        *,
+        source: Any,
+        event: MessageEvent,
+        turns: int = 1,
+        delete_user_messages: bool = True,
+        dry_run: bool = False,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        """Best-effort delete the last visible Discord turn(s) for ``/rewind``.
+
+        This is intentionally adapter-level: only Discord knows how to map a
+        Hermes turn to visible Discord messages and what can actually be
+        deleted. The scan is conservative for multi-user safety: if another
+        user's conversational message is newer than the target user's turn, it
+        aborts rather than crossing someone else's visible turn.
+        """
+        result: dict[str, Any] = {
+            "supported": True,
+            "dry_run": bool(dry_run),
+            "matched_turns": 0,
+            "matched_user_message_ids": [],
+            "matched_user_message_contents": [],
+            "planned": 0,
+            "planned_bot": 0,
+            "planned_status": 0,
+            "planned_user": 0,
+            "kept_cron": 0,
+            "deleted_bot": 0,
+            "deleted_status": 0,
+            "deleted_user": 0,
+            "kept_user": 0,
+            "failed": 0,
+            "failed_bot": 0,
+            "failed_status": 0,
+            "failed_user": 0,
+        }
+        if not self._client or not DISCORD_AVAILABLE:
+            result["error"] = "Discord client is not connected"
+            return result
+
+        channel_id = str(getattr(source, "thread_id", "") or getattr(source, "chat_id", "") or "")
+        if not channel_id:
+            result["error"] = "missing Discord channel/thread id"
+            return result
+
+        try:
+            channel = self._client.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(channel_id))
+        except Exception as exc:
+            result["error"] = f"cannot resolve Discord channel {channel_id}: {exc}"
+            return result
+        if channel is None:
+            result["error"] = f"Discord channel {channel_id} not found"
+            return result
+
+        can_delete_user_messages: bool | None = None
+        if delete_user_messages:
+            permissions_for = getattr(channel, "permissions_for", None)
+            if callable(permissions_for):
+                member = None
+                guild = getattr(channel, "guild", None)
+                if guild is not None:
+                    member = getattr(guild, "me", None)
+                    if member is None:
+                        get_member = getattr(guild, "get_member", None)
+                        if callable(get_member):
+                            try:
+                                member = get_member(int(getattr(self._client.user, "id", 0) or 0))
+                            except Exception:
+                                member = None
+                if member is None:
+                    member = getattr(self._client, "user", None)
+                if member is not None:
+                    try:
+                        perms = permissions_for(member)
+                        if hasattr(perms, "manage_messages"):
+                            can_delete_user_messages = bool(perms.manage_messages)
+                    except Exception:
+                        can_delete_user_messages = None
+            if can_delete_user_messages is False:
+                result["user_delete_permission"] = "missing_manage_messages"
+
+        before_obj = None
+        anchor_message_id = str(getattr(event, "message_id", "") or "")
+        discord_object = getattr(discord, "Object", None) if discord is not None else None
+        if anchor_message_id:
+            try:
+                before_obj = discord_object(id=int(anchor_message_id)) if discord_object else _Snowflake(int(anchor_message_id))
+            except (TypeError, ValueError):
+                before_obj = None
+
+        target_user_id = str(getattr(source, "user_id", "") or "")
+        self_user = getattr(self._client, "user", None)
+        self_user_id = str(getattr(self_user, "id", "") or "")
+
+        message_type = getattr(discord, "MessageType", None) if discord is not None else None
+        default_message = getattr(message_type, "default", None) if message_type is not None else None
+        reply_message = getattr(message_type, "reply", None) if message_type is not None else None
+        allowed_types = {item for item in (default_message, reply_message) if item is not None}
+
+        def _message_timestamp_seconds(obj: Any) -> float | None:
+            value = getattr(obj, "created_at", obj)
+            if value is None:
+                return None
+            timestamp = getattr(value, "timestamp", None)
+            if callable(timestamp):
+                try:
+                    ts_value = timestamp()
+                except Exception:
+                    return None
+                if isinstance(ts_value, (int, float)):
+                    return float(ts_value)
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            return None
+
+        event_ts = _message_timestamp_seconds(getattr(event, "timestamp", None))
+
+        candidates: list[tuple[str, Any]] = []
+        matched_turns = 0
+        inspected = 0
+
+        try:
+            kwargs: dict[str, Any] = {"limit": max(1, int(limit)), "oldest_first": False}
+            if before_obj is not None:
+                kwargs["before"] = before_obj
+            async for msg in channel.history(**kwargs):
+                inspected += 1
+                mid = str(getattr(msg, "id", "") or "")
+                if anchor_message_id and mid == anchor_message_id:
+                    continue
+                msg_type = getattr(msg, "type", None)
+                if allowed_types and msg_type is not None and msg_type not in allowed_types:
+                    continue
+                content = getattr(msg, "clean_content", None) or getattr(msg, "content", "") or ""
+                author = getattr(msg, "author", None)
+                author_id = str(getattr(author, "id", "") or "")
+                is_self = bool(
+                    (self_user is not None and author == self_user)
+                    or (self_user_id and author_id == self_user_id)
+                )
+                is_target_user = bool(target_user_id and author_id == target_user_id)
+
+                if is_self:
+                    routed_payload = _routed_user_turn_payload(str(content))
+                    if routed_payload:
+                        result["matched_user_message_ids"].append(mid)
+                        result["matched_user_message_contents"].append(routed_payload)
+                        # The marker is bot-authored and status-only for model
+                        # history, but it is a semantic user-turn boundary for
+                        # visible rewind planning.
+                        candidates.append(("status", msg))
+                        matched_turns += 1
+                        if matched_turns >= max(1, int(turns)):
+                            break
+                        continue
+                    if _looks_like_cron_delivery_history_message(str(content)):
+                        result["kept_cron"] += 1
+                        continue
+                    is_status = (
+                        mid in self._nonconversational_messages
+                        or _looks_like_nonconversational_history_message(str(content))
+                    )
+                    candidates.append(("status" if is_status else "bot", msg))
+                    continue
+
+                if is_target_user:
+                    result["matched_user_message_ids"].append(mid)
+                    result["matched_user_message_contents"].append(str(content))
+                    candidates.append(("user", msg))
+                    matched_turns += 1
+                    if matched_turns >= max(1, int(turns)):
+                        break
+                    continue
+
+                # Do not cross another human's visible turn. In a busy shared
+                # channel, deleting bot messages across another user's message
+                # can remove the wrong conversation.
+                result.update({
+                    "aborted": True,
+                    "reason": "newer message by another user; visible history is ambiguous",
+                    "inspected": inspected,
+                })
+                return result
+        except Exception as exc:
+            result["error"] = f"Discord history scan failed: {exc}"
+            return result
+
+        result["inspected"] = inspected
+        if matched_turns <= 0:
+            # Discord slash commands do not necessarily create a visible user
+            # message.  Flows such as `/goal draft` can leave only bot/status
+            # artifacts, then `/rewind` should still be able to clean up the
+            # recent bot-only visible turn.  Keep the fallback bounded by age
+            # and inter-message gap so an old lane seed is never swept up just
+            # because the thread has no visible user messages.
+            recent_bot_only: list[tuple[str, Any]] = []
+            previous_ts: float | None = None
+            for kind, msg in candidates:
+                if kind not in {"bot", "status"}:
+                    break
+                msg_ts = _message_timestamp_seconds(msg)
+                if event_ts is not None and msg_ts is not None:
+                    if event_ts - msg_ts > _DISCORD_REWIND_BOT_ONLY_MAX_AGE_SECONDS:
+                        break
+                if previous_ts is not None and msg_ts is not None:
+                    if previous_ts - msg_ts > _DISCORD_REWIND_BOT_ONLY_GAP_SECONDS:
+                        break
+                recent_bot_only.append((kind, msg))
+                if msg_ts is not None:
+                    previous_ts = msg_ts
+            if recent_bot_only:
+                candidates = recent_bot_only
+                matched_turns = 1
+                result["bot_only_visible_turn"] = True
+
+        result["matched_turns"] = matched_turns
+        if matched_turns <= 0:
+            return result
+
+        planned: list[tuple[str, Any]] = []
+        for kind, msg in candidates:
+            if kind == "user" and not delete_user_messages:
+                result["kept_user"] += 1
+                continue
+            if kind == "user" and can_delete_user_messages is False:
+                result["planned"] += 1
+                result["planned_user"] += 1
+                result["failed"] += 1
+                result["failed_user"] += 1
+                result["user_delete_failure_reason"] = "missing Manage Messages"
+                continue
+            planned.append((kind, msg))
+            result["planned"] += 1
+            if kind == "bot":
+                result["planned_bot"] += 1
+            elif kind == "status":
+                result["planned_status"] += 1
+            else:
+                result["planned_user"] += 1
+
+        if dry_run:
+            return result
+
+        for kind, msg in planned:
+            try:
+                await msg.delete()
+                if kind == "bot":
+                    result["deleted_bot"] += 1
+                elif kind == "status":
+                    result["deleted_status"] += 1
+                else:
+                    result["deleted_user"] += 1
+            except Exception as exc:
+                result["failed"] += 1
+                if kind == "bot":
+                    result["failed_bot"] += 1
+                elif kind == "status":
+                    result["failed_status"] += 1
+                else:
+                    result["failed_user"] += 1
+                logger.debug(
+                    "[%s] /rewind failed to delete Discord %s message %s: %s",
+                    self.name,
+                    kind,
+                    getattr(msg, "id", "?"),
+                    exc,
+                )
+        return result
 
     async def _fetch_channel_context(
         self,

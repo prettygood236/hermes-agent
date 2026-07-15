@@ -67,6 +67,46 @@ def _int_value(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+def _parse_rewind_args(raw_args: str) -> tuple[int, bool, bool, list[str]]:
+    """Parse ``/rewind`` args.
+
+    Returns ``(turns, delete_user_messages, dry_run, unknown_tokens)``.
+    ``/rewind`` defaults to a visible full turn rewind: remove the internal
+    history turn and ask the adapter to delete both Hermes replies and the
+    invoking user's visible messages when platform permissions allow it.
+    """
+    try:
+        tokens = shlex.split(raw_args or "")
+    except ValueError:
+        tokens = (raw_args or "").split()
+
+    turns = 1
+    delete_user_messages = True
+    dry_run = False
+    unknown: list[str] = []
+    consumed_count = False
+
+    for token in tokens:
+        norm = token.strip().lower()
+        if not norm:
+            continue
+        if not consumed_count:
+            try:
+                turns = max(1, int(norm))
+                consumed_count = True
+                continue
+            except ValueError:
+                pass
+        if norm in {"bot-only", "assistant-only", "keep-user", "keep-users"}:
+            delete_user_messages = False
+        elif norm in {"full", "all", "delete-user", "delete-users"}:
+            delete_user_messages = True
+        elif norm in {"dry-run", "dryrun", "preview", "check"}:
+            dry_run = True
+        else:
+            unknown.append(token)
+
+    return turns, delete_user_messages, dry_run, unknown
 
 
 def _model_switch_skew_guard() -> Optional[str]:
@@ -3102,19 +3142,8 @@ class GatewaySlashCommandsMixin:
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         result = await self.async_session_store.rewind_session(session_entry.session_id, n)
-
         if result is None:
             return t("gateway.undo.nothing")
-
-        # Reset stored token count — transcript was truncated.
-        session_entry.last_prompt_tokens = 0
-        # Evict the cached agent so the next turn rebuilds from the active-only
-        # transcript and memory providers refresh their per-session caches.
-        try:
-            session_key = build_session_key(source)
-            self._evict_cached_agent(session_key)
-        except Exception as e:
-            logger.debug("undo: cached-agent eviction skipped: %s", e)
 
         target_text = result["target_text"]
         preview = target_text[:200] + "..." if len(target_text) > 200 else target_text
@@ -3124,6 +3153,282 @@ class GatewaySlashCommandsMixin:
             count=result["rewound_count"],
             preview=preview,
         )
+
+
+    async def _rewind_gateway_session_history(self, source: SessionSource, n: int) -> Optional[dict[str, Any]]:
+        """Soft-delete the last ``n`` user turns and evict the cached agent."""
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        result = await self.async_session_store.rewind_session(session_entry.session_id, n)
+
+        if result is None:
+            return None
+
+        # Reset stored token count — transcript was truncated.
+        session_entry.last_prompt_tokens = 0
+        # Evict the cached agent so the next turn rebuilds from the active-only
+        # transcript and memory providers refresh their per-session caches.
+        try:
+            session_key = build_session_key(source)
+            self._evict_cached_agent(session_key)
+        except Exception as e:
+            logger.debug("rewind: cached-agent eviction skipped: %s", e)
+        return result
+
+    def _text_from_rewind_content(self, content: Any) -> str:
+        """Flatten a stored user-message content value for rewind matching."""
+        if isinstance(content, list):
+            parts = [
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            return "\n".join(part for part in parts if part)
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        return str(content)
+
+    def _peek_gateway_rewind_target(self, source: SessionSource, n: int) -> Optional[dict[str, Any]]:
+        """Return the active user row ``rewind_session`` would target, without mutating DB."""
+        session_store = getattr(self, "session_store", None)
+        if session_store is None:
+            return None
+        session_entry = session_store.get_or_create_session(source)
+        db = getattr(session_store, "_db", None)
+        if db is None:
+            return None
+        try:
+            recents = db.list_recent_user_messages(session_entry.session_id, limit=max(n, 10))
+        except Exception as e:
+            logger.debug("rewind: failed to peek recent user messages: %s", e)
+            return None
+        if not recents:
+            return None
+        target_idx = min(max(n, 1) - 1, len(recents) - 1)
+        target_id = recents[target_idx].get("id")
+        try:
+            messages = db.get_messages(session_entry.session_id)
+        except Exception as e:
+            logger.debug("rewind: failed to load messages for target peek: %s", e)
+            messages = []
+        target = next((msg for msg in messages if msg.get("id") == target_id), None)
+        if target is None:
+            return {"id": target_id, "text": recents[target_idx].get("preview") or ""}
+        target = dict(target)
+        target["text"] = self._text_from_rewind_content(target.get("content"))
+        return target
+
+    def _visible_rewind_allows_history_rewind(
+        self,
+        visible_result: Optional[dict[str, Any]],
+        source: SessionSource,
+        n: int,
+    ) -> tuple[bool, str | None]:
+        """Guard internal history rewind against deleting a different visible turn.
+
+        Discord can have visible turns that never became committed Hermes history
+        (for example a run stopped while auto-compressing before the user prompt
+        was appended). In that case `/rewind` should clean the visible stopped
+        turn but MUST NOT fall through to the previous committed user prompt.
+        """
+        if not visible_result or not visible_result.get("supported", True):
+            return True, None
+        if visible_result.get("error"):
+            return False, "visible cleanup failed; internal history was left unchanged"
+        if visible_result.get("aborted"):
+            return False, "visible history was ambiguous; internal history was left unchanged"
+        if visible_result.get("bot_only_visible_turn"):
+            return False, "visible cleanup matched only bot/status artifacts"
+
+        visible_ids = [
+            str(item)
+            for item in (visible_result.get("matched_user_message_ids") or [])
+            if str(item)
+        ]
+        visible_contents = [
+            str(item)
+            for item in (visible_result.get("matched_user_message_contents") or [])
+            if str(item).strip()
+        ]
+        if not visible_ids and not visible_contents:
+            return False, "no visible user turn matched; internal history was left unchanged"
+
+        target = self._peek_gateway_rewind_target(source, n)
+        if target is None:
+            return False, "visible turn had no committed Hermes prompt"
+
+        expected_visible_id = visible_ids[-1] if visible_ids else ""
+        target_platform_id = str(target.get("platform_message_id") or "")
+        target_text = self._text_from_rewind_content(target.get("content")) or str(target.get("text") or "")
+        if expected_visible_id:
+            trigger_ids = set(re.findall(r"Triggering message id:\s*`?(\d+)`?", target_text))
+            if target_platform_id == expected_visible_id or expected_visible_id in trigger_ids:
+                return True, None
+
+        if visible_contents:
+            expected_text = " ".join(visible_contents[-1].split())
+            target_norm = " ".join(target_text.split())
+            if expected_text and target_norm and (expected_text in target_norm or target_norm in expected_text):
+                return True, None
+
+        return False, "visible user turn was not the last committed Hermes prompt"
+
+    async def _handle_rewind_command(self, event: MessageEvent) -> str:
+        """Handle /rewind [N] — /undo plus platform-visible message cleanup.
+
+        ``/undo`` is intentionally internal-only. ``/rewind`` is the gateway
+        counterpart: it rewinds Hermes history and asks the active platform
+        adapter to delete the same visible turn when supported. Unsupported
+        platforms fall back to the internal rewind and report the limitation.
+        """
+        source = event.source
+        raw_args = event.get_command_args().strip()
+        n, delete_user_messages, dry_run, unknown = _parse_rewind_args(raw_args)
+        if unknown:
+            return (
+                "Usage: /rewind [N] [bot-only|keep-user|dry-run]\n"
+                f"Unknown option(s): {', '.join(unknown)}"
+            )
+
+        adapters = getattr(self, "adapters", {}) or {}
+        adapter = adapters.get(source.platform) if source and source.platform else None
+        visible_result: dict[str, Any] | None = None
+        rewind_visible = getattr(adapter, "rewind_visible_turns", None) if adapter else None
+
+        if rewind_visible is not None:
+            try:
+                visible_result = rewind_visible(
+                    source=source,
+                    event=event,
+                    turns=n,
+                    delete_user_messages=delete_user_messages,
+                    dry_run=dry_run,
+                )
+                if inspect.isawaitable(visible_result):
+                    visible_result = await visible_result
+            except Exception as exc:
+                logger.debug("/rewind visible cleanup failed", exc_info=True)
+                visible_result = {"supported": True, "error": str(exc)}
+        else:
+            visible_result = {
+                "supported": False,
+                "platform": getattr(getattr(source, "platform", None), "value", None) or "gateway",
+            }
+
+        lines: list[str] = []
+        if dry_run:
+            lines.append(f"🔎 /rewind dry-run for {n} turn{'s' if n != 1 else ''}.")
+            lines.append("Session history: unchanged.")
+        else:
+            allow_history_rewind, history_skip_reason = self._visible_rewind_allows_history_rewind(
+                visible_result,
+                source,
+                n,
+            )
+            if allow_history_rewind:
+                result = await self._rewind_gateway_session_history(source, n)
+                if result is None:
+                    lines.append("Session history: unchanged; no committed user turn found.")
+                else:
+                    lines.append(
+                        f"↩️ Rewound {result['turns_undone']} turn{'s' if result['turns_undone'] != 1 else ''} "
+                        f"in Hermes history ({result['rewound_count']} row{'s' if result['rewound_count'] != 1 else ''})."
+                    )
+                    target_text = result.get("target_text") or ""
+                    if target_text:
+                        preview = target_text[:160] + "..." if len(target_text) > 160 else target_text
+                        lines.append(f"Backed-up prompt preview: {preview}")
+            else:
+                reason = history_skip_reason or "visible cleanup did not identify the same committed turn"
+                lines.append(f"Session history: unchanged; {reason}.")
+
+        lines.extend(self._format_visible_rewind_result(visible_result, delete_user_messages=delete_user_messages))
+        return "\n".join(line for line in lines if line)
+
+    def _format_visible_rewind_result(
+        self,
+        result: Optional[dict[str, Any]],
+        *,
+        delete_user_messages: bool,
+    ) -> list[str]:
+        """Render adapter visible-rewind details for gateway users."""
+        if not result:
+            return ["Visible messages: no platform result returned."]
+        if not result.get("supported", True):
+            platform = result.get("platform") or "this platform"
+            return [f"Visible messages: unsupported on {platform}; internal history handled only."]
+        if result.get("error"):
+            return [f"Visible messages: cleanup failed ({result['error']})."]
+        if result.get("aborted"):
+            return [f"Visible messages: not changed ({result.get('reason') or 'ambiguous visible history'})."]
+
+        planned = int(result.get("planned", 0) or 0)
+        matched_turns = int(result.get("matched_turns", 0) or 0)
+        dry_run = bool(result.get("dry_run"))
+        if dry_run:
+            bot = int(result.get("planned_bot", 0) or 0)
+            status = int(result.get("planned_status", 0) or 0)
+            user = int(result.get("planned_user", 0) or 0)
+            kept_cron = int(result.get("kept_cron", 0) or 0)
+            if planned <= 0:
+                suffix = f"; cron deliveries kept {kept_cron}" if kept_cron else ""
+                return [f"Visible messages: no matching visible turn found{suffix}."]
+            bot_part = f"bot replies {bot}"
+            if status:
+                bot_part += f", status messages {status}"
+            user_limited = result.get("user_delete_permission") == "missing_manage_messages"
+            if delete_user_messages:
+                user_part = f", user messages {user}"
+                if user_limited:
+                    user_part += " (missing Manage Messages)"
+            else:
+                user_part = ", user messages kept"
+            cron_part = f", cron deliveries kept {kept_cron}" if kept_cron else ""
+            return [
+                f"Visible messages: would delete {planned} message(s) "
+                f"for {matched_turns} turn(s) ({bot_part}{user_part}{cron_part})."
+            ]
+
+        deleted_bot = int(result.get("deleted_bot", 0) or 0)
+        deleted_status = int(result.get("deleted_status", 0) or 0)
+        deleted_user = int(result.get("deleted_user", 0) or 0)
+        failed = int(result.get("failed", 0) or 0)
+        kept_user = int(result.get("kept_user", 0) or 0)
+        kept_cron = int(result.get("kept_cron", 0) or 0)
+        if planned <= 0:
+            suffix = f"; cron deliveries kept {kept_cron}" if kept_cron else ""
+            return [f"Visible messages: no matching visible turn found to delete{suffix}."]
+        parts = [f"bot replies deleted {deleted_bot}"]
+        if deleted_status or int(result.get("planned_status", 0) or 0):
+            parts.append(f"status messages deleted {deleted_status}")
+        user_limited = result.get("user_delete_permission") == "missing_manage_messages"
+        if delete_user_messages:
+            parts.append(f"user messages deleted {deleted_user}")
+        else:
+            parts.append(f"user messages kept {kept_user}")
+        if kept_cron:
+            parts.append(f"cron deliveries kept {kept_cron}")
+        if failed:
+            failure_parts = []
+            failed_bot = int(result.get("failed_bot", 0) or 0)
+            failed_status = int(result.get("failed_status", 0) or 0)
+            failed_user = int(result.get("failed_user", 0) or 0)
+            if failed_bot:
+                failure_parts.append(f"bot {failed_bot}")
+            if failed_status:
+                failure_parts.append(f"status {failed_status}")
+            if failed_user:
+                if user_limited or result.get("user_delete_failure_reason"):
+                    reason = result.get("user_delete_failure_reason") or "missing Manage Messages"
+                    failure_parts.append(f"user {failed_user}: {reason}")
+                else:
+                    failure_parts.append(f"user {failed_user}")
+            if failure_parts:
+                parts.append(f"failed {failed} ({', '.join(failure_parts)})")
+            else:
+                parts.append(f"failed {failed}")
+        return [f"Visible messages: {'; '.join(parts)}."]
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
