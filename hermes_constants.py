@@ -1370,6 +1370,53 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     return result
 
 
+def _parse_service_tier_value(value: object) -> tuple[bool, str | None]:
+    """Parse one service-tier value while preserving explicit NORMAL."""
+    raw = str(value or "").strip().lower()
+    if raw in {"normal", "default", "standard", "off", "none"}:
+        return True, None
+    if raw in {"fast", "priority", "on"}:
+        return True, "priority"
+    return False, None
+
+
+def resolve_service_tier_config(cfg: dict | None, model: str = "") -> str | None:
+    """Resolve per-model FAST/NORMAL, then fall back to the profile default.
+
+    Model lookup uses the same spelling-tolerant variants as reasoning
+    overrides, so YAML-safe ``gpt-5-6-sol`` matches runtime
+    ``gpt-5.6-sol``. Explicit per-model NORMAL returns ``None`` and therefore
+    disables a global FAST default.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = cfg.get("agent")
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+
+    if not model:
+        model_cfg = cfg.get("model")
+        if isinstance(model_cfg, str):
+            model = model_cfg.strip()
+        elif isinstance(model_cfg, dict):
+            model = str(
+                model_cfg.get("default") or model_cfg.get("model") or ""
+            ).strip()
+
+    overrides = agent_cfg.get("service_tier_overrides") or {}
+    if isinstance(overrides, dict) and model:
+        for variant in _canonical_model_variants(model):
+            if variant not in overrides:
+                continue
+            recognized, tier = _parse_service_tier_value(overrides[variant])
+            if recognized:
+                return tier
+
+    recognized, tier = _parse_service_tier_value(
+        agent_cfg.get("service_tier", "")
+    )
+    return tier if recognized else None
+
+
 def is_termux() -> bool:
     """Return True when running inside a Termux (Android) environment.
 

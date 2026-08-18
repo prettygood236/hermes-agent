@@ -170,3 +170,25 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
 
 
+def test_model_tier_override_survives_without_session_pin(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {
+            "model": {"default": "gpt-5.6-luna"},
+            "agent": {
+                "service_tier": "fast",
+                "service_tier_overrides": {"gpt-5-6-sol": "normal"},
+            },
+        },
+    )
+
+    assert runner._resolve_session_service_tier(
+        session_key="sol-session", model="gpt-5.6-sol"
+    ) is None
+    assert runner._resolve_session_service_tier(
+        session_key="luna-session", model="gpt-5.6-luna"
+    ) == "priority"
+
+

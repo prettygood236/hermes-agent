@@ -140,6 +140,7 @@ DEFAULT_CONFIG = {
             "cost_threshold_usd": 0.25,
         },
         "service_tier": "",
+        "service_tier_overrides": {},
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false

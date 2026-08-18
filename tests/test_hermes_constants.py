@@ -534,6 +534,46 @@ class TestReasoningOverridesDefaultConfig:
         assert result2 == {"enabled": True, "effort": "low"}
 
 
+class TestResolveServiceTierConfig:
+    def _cfg(self, tier="fast", overrides=None, default_model="gpt-5.6-luna"):
+        return {
+            "model": {"default": default_model},
+            "agent": {
+                "service_tier": tier,
+                "service_tier_overrides": overrides or {},
+            },
+        }
+
+    def test_sol_explicit_normal_beats_global_fast(self):
+        from hermes_constants import resolve_service_tier_config
+        cfg = self._cfg(overrides={"gpt-5-6-sol": "normal"})
+        assert resolve_service_tier_config(cfg, "gpt-5.6-sol") is None
+        assert resolve_service_tier_config(cfg, "gpt-5.6-luna") == "priority"
+
+    def test_empty_model_uses_config_default(self):
+        from hermes_constants import resolve_service_tier_config
+        cfg = self._cfg(
+            overrides={"gpt-5-6-sol": "normal"},
+            default_model="gpt-5.6-sol",
+        )
+        assert resolve_service_tier_config(cfg) is None
+
+    def test_invalid_override_falls_back_to_global(self):
+        from hermes_constants import resolve_service_tier_config
+        cfg = self._cfg(overrides={"gpt-5-6-sol": "turbo"})
+        assert resolve_service_tier_config(cfg, "gpt-5.6-sol") == "priority"
+
+    def test_default_config_has_service_tier_overrides(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["agent"]["service_tier_overrides"] == {}
+
+    def test_model_override_leaf_is_a_recognized_config_key(self):
+        from hermes_cli.config import _validate_config_key
+        assert _validate_config_key(
+            "agent.service_tier_overrides.gpt-5-6-sol"
+        ) == (True, None)
+
+
 class TestSecureParentDir:
     """Tests for secure_parent_dir() — prevents chmod on / or top-level dirs."""
 

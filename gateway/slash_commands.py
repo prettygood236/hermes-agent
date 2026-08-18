@@ -4151,12 +4151,17 @@ class GatewaySlashCommandsMixin:
         # normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(raw_args)
         session_key = self._session_key_for_source(event.source)
-        self._service_tier = self._resolve_session_service_tier(
-            session_key=session_key
-        )
-
         user_config = _load_gateway_config()
         model = _resolve_gateway_model(user_config)
+        try:
+            self._rehydrate_session_model_override(session_key)
+            model_override = self._session_model_overrides.get(session_key) or {}
+            model = str(model_override.get("model") or model)
+        except Exception:
+            pass
+        self._service_tier = self._resolve_session_service_tier(
+            session_key=session_key, model=model
+        )
         if not model_supports_fast_mode(model):
             return t("gateway.fast.not_supported")
 

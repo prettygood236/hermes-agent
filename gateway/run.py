@@ -5145,7 +5145,7 @@ class TurnRunner:
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
-            source=ctx.source, session_key=ctx.session_key
+            source=ctx.source, session_key=ctx.session_key, model=model
         )
         # Set up stream consumer for token streaming or interim commentary.
         _stream_consumer = None
@@ -9075,6 +9075,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         source=None,
         session_key: Optional[str] = None,
+        model: str = "",
     ) -> Optional[str]:
         """Resolve the effective service tier for a session.
 
@@ -9097,7 +9098,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 is not _SERVICE_TIER_UNSET
             ):
                 return _t_state.conversation.service_tier_override
-        return self._load_service_tier()
+        return self._load_service_tier(model)
 
     def _set_session_service_tier_override(
         self,
@@ -9121,23 +9122,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     @staticmethod
-    def _load_service_tier() -> str | None:
-        """Load Priority Processing setting from config.yaml.
-
-        Reads agent.service_tier from config.yaml. Accepted values mirror the CLI:
-        "fast"/"priority"/"on" => "priority", while "normal"/"off" disables it.
-        Returns None when unset or unsupported.
-        """
+    def _load_service_tier(model: str = "") -> str | None:
+        """Load model-aware Priority Processing from config.yaml."""
+        from hermes_constants import resolve_service_tier_config
         cfg = _load_gateway_runtime_config()
-        raw = str(cfg_get(cfg, "agent", "service_tier", default="") or "").strip()
-
-        value = raw.lower()
-        if not value or value in {"normal", "default", "standard", "off", "none"}:
-            return None
-        if value in {"fast", "priority", "on"}:
-            return "priority"
-        logger.warning("Unknown service_tier '%s', ignoring", raw)
-        return None
+        return resolve_service_tier_config(cfg, model)
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -22021,7 +22010,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source, model=model
             )
             self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(source=source)
+            self._service_tier = self._resolve_session_service_tier(
+                source=source, model=model
+            )
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             # Enrich the prompt with image descriptions so the background

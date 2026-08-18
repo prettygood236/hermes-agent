@@ -5043,6 +5043,14 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "loops",
 })
 
+# Nested mappings whose leaf names are model IDs supplied by the user. These
+# are schema-known containers even though DEFAULT_CONFIG cannot enumerate
+# future model keys.
+_OPEN_DICT_CONFIG_PATHS = frozenset({
+    "agent.reasoning_overrides",
+    "agent.service_tier_overrides",
+})
+
 # Top-level keys whose sub-keys are partially schema-defined (e.g. on a
 # PlatformConfig dataclass) but where users may legitimately add fields
 # that DEFAULT_CONFIG doesn't enumerate (extras, per-channel overrides,
@@ -5176,6 +5184,8 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     node: Any = DEFAULT_CONFIG.get(top)
     consumed = [top]
     for seg in segments[1:]:
+        if ".".join(consumed) in _OPEN_DICT_CONFIG_PATHS:
+            return True, None
         # ``gateway.platforms.<name>.<field>`` (and any other nested
         # ``platforms`` container) — the segment after ``platforms`` is a
         # user-supplied platform name, so accept everything below it.
